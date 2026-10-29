@@ -1,0 +1,438 @@
+# capwrapp-pipeline: 2
+# Installed by CapWrapp. Reinstalling from CapWrapp Settings replaces this file.
+name: CapWrapp native
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit SHA to ship
+        required: true
+        type: string
+      channel:
+        description: Unused for native; accepted so CapWrapp can dispatch one input shape
+        required: false
+        type: string
+      version:
+        description: Store version name (CFBundleShortVersionString / versionName)
+        required: false
+        type: string
+      ios:
+        description: Upload to TestFlight (true/false)
+        required: false
+        default: 'true'
+        type: string
+      android:
+        description: Upload to Play Internal (true/false)
+        required: false
+        default: 'true'
+        type: string
+      report_url:
+        description: CapWrapp Functions origin for step reports
+        required: false
+        type: string
+      report_token:
+        description: Short-lived token for CapWrapp step reports
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capwrapp-native-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask CapWrapp token
+        if: ${{ inputs.report_token != '' }}
+        run: echo "::add-mask::${{ inputs.report_token }}"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Overlay CapWrapp helpers from the workflow branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          sparse-checkout: |
+            .capwrapp
+          sparse-checkout-cone-mode: false
+          path: .capwrapp-src
+
+      - name: Keep helpers even if this SHA predates the pipeline
+        run: |
+          mkdir -p .capwrapp
+          if [ -d .capwrapp-src/.capwrapp ]; then
+            cp -R .capwrapp-src/.capwrapp/. .capwrapp/
+          fi
+          rm -rf .capwrapp-src
+          chmod +x .capwrapp/*.sh .capwrapp/*.py 2>/dev/null || true
+
+      - name: Report checkout
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh checkout success "Checked out ${{ inputs.sha }}"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: bash .capwrapp/install-js.sh
+
+      - name: Report install
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh install success "Dependencies installed"
+
+      - name: Fetch CapWrapp secrets
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/fetch-secrets.sh
+
+      - name: Build web app
+        env:
+          CAPWRAPP_NATIVE: "1"
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: |
+          if ! bash .capwrapp/build-web.sh; then
+            bash .capwrapp/report.sh web_build failed "Web build did not produce a static index.html for Capacitor (needs a folder with index.html, not a server/worker bundle)."
+            exit 1
+          fi
+
+      - name: Report web build
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh web_build success "Web build finished"
+
+      - name: Capacitor sync
+        run: npx cap sync
+
+      - name: Pack native trees
+        run: bash .capwrapp/keep-native.sh pack
+
+      - name: Report sync
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh cap_sync success "Capacitor projects synced"
+
+      # Handoff to the iOS/Android jobs only (45-220 MB on real apps). The cleanup job
+      # deletes it when the run ends; the 1-day retention covers a failed delete.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: capwrapp-native-${{ github.run_id }}
+          retention-days: 1
+          include-hidden-files: true
+          path: |
+            .capwrapp
+            ios
+            android
+            dist
+            dist/client
+            build
+            build/client
+            www
+            out
+            .output/public
+            .vercel/output/static
+            capacitor.config.ts
+            capacitor.config.json
+            capacitor.config.js
+            package.json
+          if-no-files-found: warn
+
+  ios:
+    needs: prepare
+    if: ${{ inputs.ios == 'true' }}
+    runs-on: macos-latest
+    steps:
+      - name: Mask CapWrapp token
+        if: ${{ inputs.report_token != '' }}
+        run: echo "::add-mask::${{ inputs.report_token }}"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: capwrapp-native-${{ github.run_id }}
+
+      - name: Restore iOS tree
+        run: bash .capwrapp/keep-native.sh unpack-ios
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install JavaScript dependencies
+        run: bash .capwrapp/install-js.sh
+
+      - name: Fetch store secrets
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/fetch-secrets.sh
+
+      - name: Report iOS archive
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh ios_archive running "Archiving on a macOS runner (this uses GitHub minutes)"
+
+      - name: CocoaPods
+        run: |
+          if [ -f ios/App/Podfile ]; then
+            cd ios/App && pod install
+          elif [ -f ios/Podfile ]; then
+            cd ios && pod install
+          fi
+
+      - name: Encryption compliance
+        env:
+          CAPWRAPP_USES_NON_EXEMPT_ENCRYPTION: ${{ env.CAPWRAPP_USES_NON_EXEMPT_ENCRYPTION }}
+        run: |
+          FLAG="false"
+          if [ "$CAPWRAPP_USES_NON_EXEMPT_ENCRYPTION" = "true" ]; then FLAG="true"; fi
+          FOUND=0
+          for PLIST in ios/App/App/Info.plist ios/App/Info.plist; do
+            if [ -f "$PLIST" ]; then
+              FOUND=1
+              /usr/libexec/PlistBuddy -c "Delete :ITSAppUsesNonExemptEncryption" "$PLIST" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool $FLAG" "$PLIST"
+              CODE="$(/usr/libexec/PlistBuddy -c "Print :ITSEncryptionExportComplianceCode" "$PLIST" 2>/dev/null || true)"
+              if [ "$FLAG" = "false" ]; then
+                if [ -z "$CODE" ]; then
+                  /usr/libexec/PlistBuddy -c "Delete :ITSEncryptionExportComplianceCode" "$PLIST" 2>/dev/null || true
+                fi
+              elif [ -z "$CODE" ]; then
+                echo "Non-exempt encryption is on in CapWrapp, but $PLIST has no ITSEncryptionExportComplianceCode." >&2
+                echo "App Store Connect rejects that upload with error 90592 (empty export compliance code)." >&2
+                echo "Uncheck the encryption box, or copy the code from App Store Connect → App Information → App Encryption Documentation into Info.plist." >&2
+                exit 1
+              fi
+            fi
+          done
+          if [ "$FOUND" = "0" ]; then
+            echo "No Info.plist at ios/App/App/Info.plist or ios/App/Info.plist; encryption keys were not written."
+          fi
+
+      - name: Fastlane TestFlight
+        env:
+          CAPWRAPP_VERSION: ${{ inputs.version }}
+          CAPWRAPP_SHA: ${{ inputs.sha }}
+        run: |
+          gem install fastlane --no-document
+          bash .capwrapp/run-fastlane.sh ios capwrapp_internal
+
+      - name: Report iOS upload
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: |
+          bash .capwrapp/report.sh ios_archive success "iOS archive signed"
+          bash .capwrapp/report.sh ios_upload success "Uploaded to TestFlight"
+
+      - name: Report iOS failure
+        if: failure()
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: |
+          bash .capwrapp/report.sh ios_archive failed "iOS archive or TestFlight upload failed. Open the Actions log."
+          bash .capwrapp/report.sh ios_upload failed "iOS archive or TestFlight upload failed. Open the Actions log."
+
+  android:
+    needs: prepare
+    if: ${{ inputs.android == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask CapWrapp token
+        if: ${{ inputs.report_token != '' }}
+        run: echo "::add-mask::${{ inputs.report_token }}"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: capwrapp-native-${{ github.run_id }}
+
+      - name: Restore Android tree
+        run: bash .capwrapp/keep-native.sh unpack-android
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install JavaScript dependencies
+        run: bash .capwrapp/install-js.sh
+
+      - name: Check Capacitor Android library
+        run: bash .capwrapp/keep-native.sh assert-android
+
+      - name: Fetch store secrets
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/fetch-secrets.sh
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        # Default packages include the legacy tools SDK package. Google no longer
+        # publishes it, so sdkmanager exits 1 with "Failed to find package tools".
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Report Android bundle
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh android_bundle running "Building a signed AAB"
+
+      - name: Decode keystore
+        env:
+          CAPWRAPP_ANDROID_KEYSTORE_BASE64: ${{ env.CAPWRAPP_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p android/app
+          echo "$CAPWRAPP_ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/capwrapp-upload.p12
+          keytool -list -keystore android/app/capwrapp-upload.p12 \
+            -storetype "${CAPWRAPP_ANDROID_KEYSTORE_TYPE:-PKCS12}" \
+            -storepass "$CAPWRAPP_ANDROID_KEYSTORE_PASSWORD"
+
+      - name: Bundle release
+        env:
+          CAPWRAPP_VERSION: ${{ inputs.version }}
+          CAPWRAPP_ANDROID_KEYSTORE_FILE: ${{ github.workspace }}/android/app/capwrapp-upload.p12
+        run: |
+          python3 .capwrapp/bump-android-version.py
+          python3 .capwrapp/apply-android-signing.py
+          chmod +x android/gradlew || true
+          cd android
+          TYPE="${CAPWRAPP_ANDROID_KEYSTORE_TYPE:-PKCS12}"
+          ./gradlew bundleRelease \
+            -Pandroid.injected.signing.store.file="$CAPWRAPP_ANDROID_KEYSTORE_FILE" \
+            -Pandroid.injected.signing.store.password="$CAPWRAPP_ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$CAPWRAPP_ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$CAPWRAPP_ANDROID_KEY_PASSWORD" \
+            -Pandroid.injected.signing.store.type="$TYPE"
+
+      - name: Report Android built
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh android_bundle success "AAB built"
+
+      - name: Fastlane Play Internal
+        env:
+          CAPWRAPP_SHA: ${{ inputs.sha }}
+        run: |
+          sudo gem install fastlane --no-document
+          bash .capwrapp/run-fastlane.sh android capwrapp_internal
+
+      - name: Report Android upload
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: bash .capwrapp/report.sh android_upload success "Uploaded to Play Internal testing"
+
+      - name: Report Android failure
+        if: failure()
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+        run: |
+          bash .capwrapp/report.sh android_bundle failed "Android bundle or Play upload failed. Open the Actions log."
+          bash .capwrapp/report.sh android_upload failed "Play rejected the upload or the bundle failed. If the log says wrong key, the SHA-1 in Play Console → App integrity must match CapWrapp Play settings. Request an upload key reset with the CapWrapp certificate, or upload the original keystore in CapWrapp."
+
+  finish:
+    needs: [prepare, ios, android]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask CapWrapp token
+        if: ${{ inputs.report_token != '' }}
+        run: echo "::add-mask::${{ inputs.report_token }}"
+
+      - uses: actions/download-artifact@v7
+        if: ${{ needs.prepare.result == 'success' }}
+        with:
+          name: capwrapp-native-${{ github.run_id }}
+
+      - name: Conclude
+        env:
+          REPORT_URL: ${{ inputs.report_url }}
+          REPORT_TOKEN: ${{ inputs.report_token }}
+          PREPARE: ${{ needs.prepare.result }}
+          IOS: ${{ needs.ios.result }}
+          ANDROID: ${{ needs.android.result }}
+          WANT_IOS: ${{ inputs.ios }}
+          WANT_ANDROID: ${{ inputs.android }}
+        run: |
+          set +e
+          if [ ! -f .capwrapp/report.sh ]; then
+            mkdir -p .capwrapp
+            printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > .capwrapp/report.sh
+            chmod +x .capwrapp/report.sh
+          fi
+          if [ "$PREPARE" != "success" ]; then
+            bash .capwrapp/report.sh ready failed "Prepare job failed. Open the Actions log."
+            exit 1
+          fi
+          if [ "$WANT_IOS" = "true" ] && [ "$IOS" != "success" ]; then
+            bash .capwrapp/report.sh ready failed "TestFlight job did not succeed."
+            exit 1
+          fi
+          if [ "$WANT_ANDROID" = "true" ] && [ "$ANDROID" != "success" ]; then
+            bash .capwrapp/report.sh ready failed "Play Internal job did not succeed."
+            exit 1
+          fi
+          bash .capwrapp/report.sh ready success "Store upload finished. Testers can install when processing completes."
+
+  cleanup:
+    # Free plans get 0.5 GB of Actions storage; a few kept handoff artifacts fill it and
+    # GitHub then blocks the upload step of every later ship. Best effort: never fails the run.
+    needs: [prepare, ios, android, finish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: Delete handoff artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: capwrapp-native-${{ github.run_id }}
+        run: |
+          set +e
+          IDS="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$ARTIFACT" --jq '.artifacts[].id')"
+          if [ -z "$IDS" ]; then
+            echo "No $ARTIFACT artifact to delete."
+          fi
+          for ID in $IDS; do
+            if gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID" >/dev/null; then
+              echo "Deleted $ARTIFACT ($ID)."
+            else
+              echo "Could not delete $ARTIFACT ($ID). GitHub removes it after 1 day."
+            fi
+          done
+          exit 0

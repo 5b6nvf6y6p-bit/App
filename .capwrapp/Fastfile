@@ -1,0 +1,233 @@
+opt_out_usage
+default_platform(:ios)
+
+def capwrapp_root
+  File.expand_path("..", __dir__)
+end
+
+def capwrapp_api_key
+  app_store_connect_api_key(
+    key_id: ENV.fetch("CAPWRAPP_APPLE_KEY_ID"),
+    issuer_id: ENV.fetch("CAPWRAPP_APPLE_ISSUER_ID"),
+    key_content: ENV.fetch("CAPWRAPP_APPLE_API_KEY"),
+    is_key_content_base64: false,
+    in_house: false
+  )
+end
+
+def capwrapp_ios_rel(*candidates)
+  candidates.each do |rel|
+    path = File.join(capwrapp_root, rel)
+    return path if File.exist?(path)
+  end
+  nil
+end
+
+# CocoaPods (Capacitor 7, or cap add ios --packagemanager CocoaPods) creates App.xcworkspace
+# after pod install. Capacitor 8 defaults to Swift Package Manager, which only has App.xcodeproj.
+def capwrapp_ios_workspace
+  capwrapp_ios_rel("ios/App/App.xcworkspace", "ios/App.xcworkspace")
+end
+
+def capwrapp_ios_project
+  capwrapp_ios_rel("ios/App/App.xcodeproj", "ios/App.xcodeproj")
+end
+
+def capwrapp_gym_source
+  workspace = capwrapp_ios_workspace
+  return { workspace: workspace } if workspace
+  project = capwrapp_ios_project
+  return { project: project } if project
+  UI.user_error!("No Xcode project under ios/App. Add Capacitor iOS before shipping TestFlight.")
+end
+
+def capwrapp_ci_keychain_password
+  ENV["MATCH_KEYCHAIN_PASSWORD"].to_s
+end
+
+# get_certificates keychain_path must be an existing file. setup_ci stores
+# ~/Library/Keychains/<name> in lane context; security create-keychain writes <name>-db.
+def capwrapp_ci_keychain_file
+  raw = lane_context[SharedValues::KEYCHAIN_PATH].to_s
+  name = ENV["MATCH_KEYCHAIN_NAME"].to_s
+  raw = File.join(Dir.home, "Library/Keychains", name) if raw.empty? && !name.empty?
+  return nil if raw.empty?
+  expanded = File.expand_path(raw)
+  ["#{expanded}-db", expanded].each { |path| return path if File.exist?(path) }
+  UI.user_error!("CI keychain not found at #{expanded} or #{expanded}-db")
+end
+
+def capwrapp_codesign(api_key, bundle_id)
+  p12 = ENV["CAPWRAPP_IOS_P12_BASE64"].to_s
+  if p12.empty?
+    UI.user_error!("Finish Apple setup in CapWrapp (save the App Store Connect API key). CapWrapp stores the signing certificate there — GitHub cannot reuse Apple certificates that have no private key.")
+  end
+  keychain_file = capwrapp_ci_keychain_file
+  if ENV["CI"] && keychain_file.nil?
+    UI.user_error!("CI keychain was not created. setup_ci must run first.")
+  end
+
+  require "base64"
+  require "tempfile"
+  file = Tempfile.new(["capwrapp", ".p12"])
+  begin
+    file.binmode
+    file.write(Base64.decode64(p12))
+    file.close
+    args = {
+      certificate_path: file.path,
+      certificate_password: ENV["CAPWRAPP_IOS_P12_PASSWORD"].to_s,
+      certificate_format: "pkcs12"
+    }
+    unless keychain_file.nil?
+      args[:keychain_path] = keychain_file
+      args[:keychain_name] = File.basename(keychain_file)
+      args[:keychain_password] = capwrapp_ci_keychain_password
+    end
+    import_certificate(args)
+  ensure
+    file.unlink
+  end
+
+  get_provisioning_profile(
+    api_key: api_key,
+    app_identifier: bundle_id,
+    team_id: ENV["CAPWRAPP_APPLE_TEAM_ID"].to_s,
+    force: true
+  )
+
+  project = capwrapp_ios_project
+  profile_name = lane_context[SharedValues::SIGH_NAME].to_s
+  profile_path = lane_context[SharedValues::SIGH_PROFILE_PATH].to_s
+  UI.user_error!("App Store Connect did not return a provisioning profile.") if profile_name.empty?
+  install_provisioning_profile(path: profile_path) unless profile_path.empty?
+  if project
+    update_code_signing_settings(
+      path: project,
+      use_automatic_signing: false,
+      team_id: ENV.fetch("CAPWRAPP_APPLE_TEAM_ID"),
+      bundle_identifier: bundle_id,
+      code_sign_identity: "Apple Distribution",
+      profile_name: profile_name,
+      targets: ["App"],
+      build_configurations: ["Release"]
+    )
+  end
+end
+
+# Later report steps send it to CapWrapp, which tags the commit with this build.
+def capwrapp_export_build_number
+  number = lane_context[SharedValues::BUILD_NUMBER].to_s.strip
+  path = ENV["GITHUB_ENV"].to_s
+  return if number.empty? || path.empty?
+  File.open(path, "a") { |fh| fh.puts("CAPWRAPP_BUILD_NUMBER=#{number}") }
+end
+
+platform :ios do
+  lane :capwrapp_internal do
+    setup_ci if ENV["CI"]
+    api_key = capwrapp_api_key
+    bundle_id = ENV.fetch("CAPWRAPP_IOS_BUNDLE_ID")
+    version = ENV["CAPWRAPP_VERSION"].to_s.strip
+    project = capwrapp_ios_project
+    team_id = ENV.fetch("CAPWRAPP_APPLE_TEAM_ID")
+
+    if project && !version.empty?
+      increment_version_number(version_number: version, xcodeproj: project)
+    end
+
+    begin
+      latest = latest_testflight_build_number(api_key: api_key, app_identifier: bundle_id)
+      increment_build_number(build_number: latest + 1, xcodeproj: project) if project
+    rescue => err
+      UI.important("Could not read TestFlight build number (#{err.message}). Using run number.")
+      increment_build_number(build_number: ENV.fetch("GITHUB_RUN_NUMBER", "1"), xcodeproj: project) if project
+    end
+    capwrapp_export_build_number if project
+
+    capwrapp_codesign(api_key, bundle_id)
+
+    profile_name = lane_context[SharedValues::SIGH_NAME].to_s
+    # Signing stays on the App target (update_code_signing_settings above).
+    # xcodebuild xcargs apply to every target, including Swift packages such as
+    # RevenueCat, which fail the archive when given an App Store profile.
+    build_app(
+      {
+        scheme: "App",
+        configuration: "Release",
+        export_method: "app-store",
+        export_team_id: team_id,
+        skip_profile_detection: true,
+        export_options: {
+          method: "app-store",
+          signingStyle: "manual",
+          teamID: team_id,
+          signingCertificate: "Apple Distribution",
+          provisioningProfiles: {
+            bundle_id => profile_name
+          }
+        },
+        output_directory: File.join(capwrapp_root, "dist-native"),
+        output_name: "App.ipa"
+      }.merge(capwrapp_gym_source)
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      skip_waiting_for_build_processing: true,
+      skip_submission: true,
+      app_identifier: bundle_id
+    )
+  end
+end
+
+def capwrapp_play_release_notes
+  raw = ENV["CAPWRAPP_PLAY_RELEASE_NOTES"].to_s
+  return {} if raw.strip.empty?
+  notes = {}
+  raw.scan(%r{<([A-Za-z0-9\-]+)>\s*(.*?)\s*</\1>}m) do |lang, text|
+    cleaned = text.to_s.strip
+    notes[lang] = cleaned unless cleaned.empty?
+  end
+  notes
+end
+
+platform :android do
+  lane :capwrapp_internal do
+    aab = Dir[File.join(capwrapp_root, "android/app/build/outputs/bundle/release/*.aab")].first
+    UI.user_error!("No release AAB found. Gradle bundleRelease did not produce an artifact.") unless aab
+    notes = capwrapp_play_release_notes
+    metadata_path = nil
+    unless notes.empty?
+      require "fileutils"
+      require "tmpdir"
+      metadata_path = File.join(Dir.mktmpdir("capwrapp-play"), "android")
+      notes.each do |lang, text|
+        dir = File.join(metadata_path, lang, "changelogs")
+        FileUtils.mkdir_p(dir)
+        File.write(File.join(dir, "default.txt"), text)
+      end
+    end
+    args = {
+      json_key_data: ENV.fetch("CAPWRAPP_PLAY_SERVICE_ACCOUNT"),
+      package_name: ENV.fetch("CAPWRAPP_ANDROID_PACKAGE"),
+      track: ENV.fetch("CAPWRAPP_PLAY_TRACK", "internal"),
+      aab: aab,
+      release_status: "completed",
+      skip_upload_metadata: true,
+      skip_upload_changelogs: notes.empty?,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    }
+    args[:metadata_path] = metadata_path unless metadata_path.nil?
+    begin
+      upload_to_play_store(args)
+    rescue => err
+      message = err.message.to_s
+      if message.match?(/wrong key|signed with the wrong key/i)
+        UI.user_error!("Play rejected the AAB: it was signed with a different upload key than the one registered in Play Console. In CapWrapp → Play Store, download the certificate (PEM) and compare the SHA-1 with Play Console → Test and release → App integrity → App signing. Request an upload key reset and attach that PEM, or upload the original keystore in CapWrapp instead of creating a new one. #{message}")
+      end
+      raise
+    end
+  end
+end
